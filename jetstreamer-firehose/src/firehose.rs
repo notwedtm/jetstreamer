@@ -1087,22 +1087,22 @@ where
                             return Ok(());
                         }
                         debug_assert!(slot < slot_range.end, "processing out-of-range slot {} (end {})", slot, slot_range.end);
-                        if slot < slot_range.start {
-                            if slot.saturating_add(1) == slot_range.start {
+                        let priming_slot = slot < local_start;
+                        if priming_slot {
+                            if slot.saturating_add(1) == local_start {
                                 log::debug!(
                                     target: &log_target,
-                                    "priming reader with preceding slot {}, skipping",
+                                    "priming reader with preceding slot {} to seed PoH blockhash state",
                                     slot
                                 );
                             } else {
                                 log::warn!(
                                     target: &log_target,
-                                    "encountered slot {} before start of range {}, skipping",
+                                    "encountered slot {} before local start {}, using it only to seed PoH blockhash state",
                                     slot,
-                                    slot_range.start
+                                    local_start
                                 );
                             }
-                            continue;
                         }
                         current_slot = Some(slot);
                         let mut entry_index: usize = 0;
@@ -1135,7 +1135,7 @@ where
                             }
                             let node = node_with_cid.get_node();
 
-                            if let Some(ref mut stats) = thread_stats {
+                            if !priming_slot && let Some(ref mut stats) = thread_stats {
                                 stats.current_slot = slot;
                             }
 
@@ -1144,7 +1144,8 @@ where
                             use crate::node::Node::*;
                             match node {
                                 Transaction(tx) => {
-                                    if tx_enabled
+                                    if !priming_slot
+                                        && tx_enabled
                                         && let Some(on_tx_cb) = on_tx.as_ref()
                                     {
                                         let error_slot = current_slot.unwrap_or(slot_range.start);
@@ -1229,15 +1230,17 @@ where
                                             )
                                         })?;
                                     }
-                                    fetch_add_if(
-                                        tracking_enabled,
-                                        &overall_transactions_processed,
-                                        1,
-                                    );
-                                    if let Some(ref mut stats) = thread_stats {
-                                        stats.transactions_processed += 1;
+                                    if !priming_slot {
+                                        fetch_add_if(
+                                            tracking_enabled,
+                                            &overall_transactions_processed,
+                                            1,
+                                        );
+                                        if let Some(ref mut stats) = thread_stats {
+                                            stats.transactions_processed += 1;
+                                        }
+                                        transactions_since_stats.fetch_add(1, Ordering::Relaxed);
                                     }
-                                    transactions_since_stats.fetch_add(1, Ordering::Relaxed);
                                 }
                                 Entry(entry) => {
                                     let entry_hash = Hash::from(entry.hash.to_bytes());
@@ -1249,7 +1252,10 @@ where
                                     this_block_executed_transaction_count += entry_transaction_count_u64;
                                     this_block_entry_count += 1;
 
-                                    if entry_enabled && let Some(on_entry_cb) = on_entry.as_ref() {
+                                    if !priming_slot
+                                        && entry_enabled
+                                        && let Some(on_entry_cb) = on_entry.as_ref()
+                                    {
                                         let starting_transaction_index = usize::try_from(
                                             starting_transaction_index_u64,
                                         )
@@ -1281,16 +1287,29 @@ where
                                         })?;
                                     }
                                     entry_index += 1;
-                                    fetch_add_if(
-                                        tracking_enabled,
-                                        &overall_entries_processed,
-                                        1,
-                                    );
-                                    if let Some(ref mut stats) = thread_stats {
-                                        stats.entries_processed += 1;
+                                    if !priming_slot {
+                                        fetch_add_if(
+                                            tracking_enabled,
+                                            &overall_entries_processed,
+                                            1,
+                                        );
+                                        if let Some(ref mut stats) = thread_stats {
+                                            stats.entries_processed += 1;
+                                        }
                                     }
                                 }
                                 Block(block) => {
+                                    if priming_slot {
+                                        log::debug!(
+                                            target: &log_target,
+                                            "processed priming slot {} to seed boundary PoH blockhash state",
+                                            slot
+                                        );
+                                        previous_blockhash = latest_entry_blockhash;
+                                        this_block_rewards = DecodedRewards::empty();
+                                        continue;
+                                    }
+
                                     let prev_last_counted_slot = last_counted_slot;
                                     let thread_stats_snapshot = thread_stats.as_ref().map(|stats| {
                                         (
@@ -1478,7 +1497,7 @@ where
                                 Subset(_subset) => (),
                                 Epoch(_epoch) => (),
                                 Rewards(rewards) => {
-                                    if reward_enabled || block_enabled {
+                                    if !priming_slot && (reward_enabled || block_enabled) {
                                         let reassembled = nodes
                                             .reassemble_dataframes(rewards.data.clone())
                                             .map_err(|err| {
@@ -2029,22 +2048,22 @@ async fn firehose_geyser_thread(
                         return Ok(());
                     }
                     debug_assert!(slot < slot_range.end, "processing out-of-range slot {} (end {})", slot, slot_range.end);
-                    if slot < local_start {
+                    let priming_slot = slot < local_start;
+                    if priming_slot {
                         if slot.saturating_add(1) == local_start {
                             log::debug!(
                                 target: &log_target,
-                                "priming reader with preceding slot {}, skipping",
+                                "priming reader with preceding slot {} to seed PoH blockhash state",
                                 slot
                             );
                         } else {
                             log::warn!(
                                 target: &log_target,
-                                "encountered slot {} before start of range {}, skipping",
+                                "encountered slot {} before local start {}, using it only to seed PoH blockhash state",
                                 slot,
                                 local_start
                             );
                         }
-                        continue;
                     }
                     current_slot = Some(slot);
                     let mut entry_index: usize = 0;
@@ -2126,7 +2145,9 @@ async fn firehose_geyser_thread(
                                     })?;
                                 let is_vote = is_simple_vote_transaction(&versioned_tx);
 
-                                if let Some(transaction_notifier) = transaction_notifier_maybe.as_ref() {
+                                if !priming_slot
+                                    && let Some(transaction_notifier) = transaction_notifier_maybe.as_ref()
+                                {
                                     transaction_notifier.notify_transaction(
                                         block.slot,
                                         tx.index.unwrap() as usize,
@@ -2152,24 +2173,35 @@ async fn firehose_geyser_thread(
                                 todo_latest_entry_blockhash = entry_hash;
                                 this_block_executed_transaction_count += entry_transaction_count_u64;
                                 this_block_entry_count += 1;
-                                if entry_notifier_maybe.is_none() {
-                                    return Ok(());
+                                if !priming_slot
+                                    && let Some(entry_notifier) = entry_notifier_maybe.as_ref()
+                                {
+                                    let entry_summary = solana_entry::entry::EntrySummary {
+                                        num_hashes: entry.num_hashes,
+                                        hash: Hash::from(entry.hash.to_bytes()),
+                                        num_transactions: entry_transaction_count_u64,
+                                    };
+                                    entry_notifier.notify_entry(
+                                        block.slot,
+                                        entry_index,
+                                        &entry_summary,
+                                        starting_transaction_index,
+                                    );
                                 }
-                                let entry_notifier = entry_notifier_maybe.as_ref().unwrap();
-                                let entry_summary = solana_entry::entry::EntrySummary {
-                                    num_hashes: entry.num_hashes,
-                                    hash: Hash::from(entry.hash.to_bytes()),
-                                    num_transactions: entry_transaction_count_u64,
-                                };
-                                entry_notifier.notify_entry(
-                                    block.slot,
-                                    entry_index,
-                                    &entry_summary,
-                                    starting_transaction_index,
-                                );
                                 entry_index += 1;
                             }
                             Block(block) => {
+                                if priming_slot {
+                                    log::debug!(
+                                        target: &log_target,
+                                        "processed priming slot {} to seed boundary PoH blockhash state",
+                                        slot
+                                    );
+                                    todo_previous_blockhash = todo_latest_entry_blockhash;
+                                    this_block_rewards = DecodedRewards::empty();
+                                    return Ok(());
+                                }
+
                                 let notification = SlotNotification::Root((block.slot, block.meta.parent_slot));
                                 confirmed_bank_sender.send(notification).unwrap();
 
@@ -2203,14 +2235,16 @@ async fn firehose_geyser_thread(
                             Subset(_subset) => (),
                             Epoch(_epoch) => (),
                             Rewards(rewards) => {
-                                let reassembled = nodes.reassemble_dataframes(rewards.data.clone())?;
-                                if !reassembled.is_empty() {
-                                    this_block_rewards = decode_rewards_from_frame(
-                                        block.slot,
-                                        reassembled,
-                                    )?;
-                                } else {
-                                    this_block_rewards = DecodedRewards::empty();
+                                if !priming_slot {
+                                    let reassembled = nodes.reassemble_dataframes(rewards.data.clone())?;
+                                    if !reassembled.is_empty() {
+                                        this_block_rewards = decode_rewards_from_frame(
+                                            block.slot,
+                                            reassembled,
+                                        )?;
+                                    } else {
+                                        this_block_rewards = DecodedRewards::empty();
+                                    }
                                 }
                             }
                             DataFrame(_data_frame) => (),
